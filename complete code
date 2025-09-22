@@ -1,0 +1,221 @@
+#include <Arduino.h>
+
+constexpr uint8_t IR_PINS[8] = {32, 33, 25, 26, 27, 14, 12, 13};
+constexpr uint8_t MOTOR_LEFT_PWM = 18;
+constexpr uint8_t MOTOR_RIGHT_PWM = 19;
+constexpr uint8_t MOTOR_LEFT_IN1 = 17;
+constexpr uint8_t MOTOR_LEFT_IN2 = 16;
+constexpr uint8_t MOTOR_RIGHT_IN1 = 4;
+constexpr uint8_t MOTOR_RIGHT_IN2 = 5;
+constexpr uint8_t LED_PIN = 2;
+constexpr uint8_t START_SWITCH_PIN = 21;
+
+constexpr uint8_t PWM_CH_L = 0;
+constexpr uint8_t PWM_CH_R = 1;
+constexpr uint32_t PWM_FREQ = 20000;
+constexpr uint8_t PWM_RES = 8;
+
+constexpr uint16_t SENSOR_THRESH = 2000;
+constexpr uint16_t INTERSECTION_THRESH = 2200;
+constexpr uint16_t ENDZONE_THRESH = 2800;
+constexpr uint16_t NOISE_FILTER = 100;
+
+constexpr float Kp = 1.2f;
+constexpr float Ki = 0.08f;
+constexpr float Kd = 0.15f;
+
+constexpr int BASE_SPEED = 180;
+constexpr int MAX_SPEED = 255;
+constexpr int MIN_SPEED = 60;
+constexpr int TURN_SPEED = 140;
+constexpr int SEARCH_SPEED = 100;
+
+constexpr unsigned long INTERSECTION_DELAY = 150;
+constexpr unsigned long TURN_DURATION = 400;
+constexpr unsigned long LOST_LINE_TIMEOUT = 200;
+constexpr unsigned long DEBOUNCE_TIME = 50;
+
+constexpr int GRID_WIDTH = 16;
+constexpr int GRID_HEIGHT = 16;
+
+enum Dir { DIR_L = 0, DIR_S = 1, DIR_R = 2, DIR_B = 3 };
+const int LSRB_ORDER[4] = { DIR_L, DIR_S, DIR_R, DIR_B };
+
+struct Cell {
+    uint8_t visitedMask;
+    uint16_t last_sel[4];
+    Cell() : visitedMask(0) { for (int i = 0; i < 4; i++) last_sel[i] = 0; }
+};
+
+Cell grid[GRID_HEIGHT][GRID_WIDTH];
+volatile uint16_t select_counter = 1;
+
+float integral = 0.0f;
+float lastError = 0.0f;
+unsigned long lastTime = 0;
+
+int currentX = GRID_WIDTH / 2;
+int currentY = GRID_HEIGHT / 2;
+int currentDir = DIR_S;
+
+bool navigationMode = false;
+unsigned long intersectionTime = 0;
+bool turningInProgress = false;
+int plannedDirection = -1;
+unsigned long turnStartTime = 0;
+
+int16_t sensors[8];
+int16_t filteredSensors[8];
+
+bool robotStarted = false;
+bool reachedEnd = false;
+unsigned long lastLineTime = 0;
+int lastKnownDirection = 1;
+
+inline void setLED(bool state) { digitalWrite(LED_PIN, state); }
+inline void stopMotors() {
+    ledcWrite(PWM_CH_L, 0);
+    ledcWrite(PWM_CH_R, 0);
+    digitalWrite(MOTOR_LEFT_IN1, LOW); digitalWrite(MOTOR_LEFT_IN2, LOW);
+    digitalWrite(MOTOR_RIGHT_IN1, LOW); digitalWrite(MOTOR_RIGHT_IN2, LOW);
+}
+inline void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+    leftSpeed = constrain(leftSpeed, -MAX_SPEED, MAX_SPEED);
+    rightSpeed = constrain(rightSpeed, -MAX_SPEED, MAX_SPEED);
+    if (leftSpeed >= 0) { digitalWrite(MOTOR_LEFT_IN1, HIGH); digitalWrite(MOTOR_LEFT_IN2, LOW); }
+    else { digitalWrite(MOTOR_LEFT_IN1, LOW); digitalWrite(MOTOR_LEFT_IN2, HIGH); }
+    if (rightSpeed >= 0) { digitalWrite(MOTOR_RIGHT_IN1, HIGH); digitalWrite(MOTOR_RIGHT_IN2, LOW); }
+    else { digitalWrite(MOTOR_RIGHT_IN1, LOW); digitalWrite(MOTOR_RIGHT_IN2, HIGH); }
+    ledcWrite(PWM_CH_L, abs(leftSpeed));
+    ledcWrite(PWM_CH_R, abs(rightSpeed));
+}
+
+inline void readIRSensors() {
+    for (uint8_t i = 0; i < 8; i++) {
+        int16_t raw = analogRead(IR_PINS[i]);
+        sensors[i] = raw;
+        filteredSensors[i] = (raw > NOISE_FILTER) ? raw : 0;
+    }
+}
+
+bool isLineDetected() {
+    for (uint8_t i = 0; i < 8; i++) if (filteredSensors[i] > SENSOR_THRESH) return true;
+    return false;
+}
+bool detectIntersection() {
+    uint8_t activeCount = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (filteredSensors[i] > INTERSECTION_THRESH) activeCount++;
+    }
+    return activeCount >= 4;
+}
+bool detectEndZone() {
+    uint8_t whiteCount = 0;
+    int32_t totalIntensity = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (filteredSensors[i] > ENDZONE_THRESH) {
+            whiteCount++;
+            totalIntensity += filteredSensors[i];
+        }
+    }
+    return (whiteCount >= 6) && (totalIntensity > 20000);
+}
+float calculateError() {
+    constexpr int16_t weights[8] = {-350, -250, -150, -50, 50, 150, 250, 350};
+    int32_t weightedSum = 0;
+    int32_t sum = 0;
+    for (uint8_t i = 0; i < 8; i++) {
+        if (filteredSensors[i] > SENSOR_THRESH) {
+            int16_t val = filteredSensors[i];
+            weightedSum += int32_t(weights[i]) * int32_t(val);
+            sum += val;
+        }
+    }
+    return (sum > 0) ? (float)weightedSum / (float)sum : 0.0f;
+}
+float getLineConfidence() {
+    int16_t maxVal = 0;
+    for (uint8_t i = 0; i < 8; i++) if (filteredSensors[i] > maxVal) maxVal = filteredSensors[i];
+    return (float)maxVal / 4095.0f;
+}
+float computePID(float error, float dt, float confidence) {
+    integral += error * dt * confidence;
+    integral = constrain(integral, -50.0f, 50.0f);
+    float derivative = (error - lastError) / dt;
+    lastError = error;
+    return (Kp * error + Ki * integral + Kd * derivative) * confidence;
+}
+void handleLostLine() {
+    static unsigned long lostTime = 0;
+    if (lostTime == 0) lostTime = millis();
+    unsigned long timeLost = millis() - lostTime;
+    if (timeLost < 300) {
+        int searchDirection = ((timeLost / 100) % 2 == 0) ? 1 : -1;
+        searchDirection *= (lastKnownDirection > 0) ? 1 : -1;
+        if (searchDirection > 0) setMotorSpeeds(SEARCH_SPEED, SEARCH_SPEED / 3);
+        else setMotorSpeeds(SEARCH_SPEED / 3, SEARCH_SPEED);
+    } else {
+        stopMotors();
+        setLED(true);
+        lostTime = 0;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(START_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(MOTOR_LEFT_IN1, OUTPUT); pinMode(MOTOR_LEFT_IN2, OUTPUT);
+    pinMode(MOTOR_RIGHT_IN1, OUTPUT); pinMode(MOTOR_RIGHT_IN2, OUTPUT);
+    ledcSetup(PWM_CH_L, PWM_FREQ, PWM_RES);
+    ledcSetup(PWM_CH_R, PWM_FREQ, PWM_RES);
+    ledcAttachPin(MOTOR_LEFT_PWM, PWM_CH_L);
+    ledcAttachPin(MOTOR_RIGHT_PWM, PWM_CH_R);
+    for (uint8_t i = 0; i < 8; i++) pinMode(IR_PINS[i], INPUT);
+    stopMotors();
+    setLED(false);
+    lastTime = millis();
+}
+
+void loop() {
+    static unsigned long lastDebounce = 0;
+    if (!robotStarted) {
+        if (digitalRead(START_SWITCH_PIN) == LOW && (millis() - lastDebounce) > DEBOUNCE_TIME) {
+            robotStarted = true;
+            lastDebounce = millis();
+            setLED(false);
+        } else {
+            stopMotors();
+            setLED((millis() / 500) % 2);
+            return;
+        }
+    }
+    readIRSensors();
+    if (!reachedEnd && detectEndZone()) {
+        stopMotors();
+        setLED(true);
+        reachedEnd = true;
+        return;
+    }
+    if (isLineDetected()) {
+        lastLineTime = millis();
+        float error = calculateError();
+        float confidence = getLineConfidence();
+        lastKnownDirection = (error >= 0) ? 1 : -1;
+        unsigned long now = millis();
+        float dt = (now - lastTime) * 0.001f;
+        if (dt <= 0) dt = 0.005f;
+        lastTime = now;
+        float correction = computePID(error, dt, confidence);
+        int adaptiveSpeed = BASE_SPEED - (int)(abs(error) * 0.08f);
+        adaptiveSpeed = constrain(adaptiveSpeed, MIN_SPEED, BASE_SPEED);
+        int leftSpeed = adaptiveSpeed + (int)correction;
+        int rightSpeed = adaptiveSpeed - (int)correction;
+        setMotorSpeeds(leftSpeed, rightSpeed);
+        setLED(false);
+    } else {
+        if (millis() - lastLineTime > LOST_LINE_TIMEOUT) {
+            handleLostLine();
+        }
+    }
+}
